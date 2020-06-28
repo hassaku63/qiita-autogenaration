@@ -1,0 +1,2 @@
+class QpError(Exception):
+    pass

@@ -1,0 +1,168 @@
+service: qiita-publish
+
+plugins:
+  - serverless-python-requirements
+  - serverless-dotenv-plugin
+  - serverless-step-functions
+  - serverless-pseudo-parameters
+
+provider:
+  name: aws
+  runtime: python3.7
+  stage: ${opt:stage, dev}
+  region: ap-northeast-1
+  environment:
+    AWS_ACCOUNT_ID: '#{AWS::AccountId}'
+    # AWS_REGION: ''  # lambda runtime already reserved
+    ARTICLE_TABLE_NAME: ${self:service}-article-${self:provider.stage}
+    PUBLISH_REQUEST_QUEUE_NAME: ${self:service}-publish-request-${self:provider.stage}
+    UPDATE_TEMPLATE_VARIABLES_QUEUE_NAME: ${self:service}-update-template-variables-${self:provider.stage}
+    PUBLISHER_STATEMACHINE_NAME: ${self:service}-${self:provider.stage}-qiitapublisher
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "dynamodb:*"
+      Resource: "*"
+    - Effect: "Allow"
+      Action:
+        - "sqs:SendMessage"
+        # - "sqs:DeleteMessage"
+      Resource: 
+        - "arn:aws:sqs:*:#{AWS::AccountId}:${self:provider.environment.PUBLISH_REQUEST_QUEUE_NAME}"
+        - "arn:aws:sqs:*:#{AWS::AccountId}:${self:provider.environment.UPDATE_TEMPLATE_VARIABLES_QUEUE_NAME}"
+    - Effect: "Allow"
+      Action: 
+        - "states:StartExecution"
+      Resource: 
+        - "arn:aws:states:#{AWS::Region}:#{AWS::AccountId}:stateMachine:${self:provider.environment.PUBLISHER_STATEMACHINE_NAME}"
+
+
+# you can add packaging information here
+package:
+  exclude:
+    - node_modules/**
+    - .env*
+
+functions:
+  # Jobs
+  ContributionSummaryJob:
+    handler: qp/functions/jobs/contribution_summarize.handler
+    timeout: 60
+    events:
+      # キリのいい時刻は AWS API が渋滞している可能性があるので意図的に半端な時刻を設定する
+      - schedule: cron(33 21 * * ? *)
+
+  # Job Consumer
+  UpdateTemplateVariablesConsumer:
+    handler: qp/functions/jobconsumer.handler
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - UpdateTemplateVariablesRequestQueue
+              - Arn
+
+  # Publisher
+  FindTemplateByArticle:
+    handler: qp/functions/sfn/publish.find_template_by_article
+  GetItemExists:
+    handler: qp/functions/sfn/publish.get_item_exists
+  CreateItem:
+    handler: qp/functions/sfn/publish.create_item
+  UpdateItem:
+    handler: qp/functions/sfn/publish.update_item
+  UpdatePublishStatus:
+    handler: qp/functions/sfn/publish.update_publish_status
+
+
+stepFunctions:
+  stateMachines:
+    QiitaPublisher:
+      name: ${self:service}-${self:provider.stage}-qiitapublisher
+      definition:
+        Comment: Publish qiita item by create or update
+        StartAt: FindTemplateByArticle
+        States:
+          FindTemplateByArticle:
+            Type: Task
+            Resource: arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${self:provider.stage}-FindTemplateByArticle
+            ResultPath: '$'
+            Next: GetItemExists
+          GetItemExists:
+            Type: Task
+            Resource: arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${self:provider.stage}-GetItemExists
+            ResultPath: $.publish_status
+            Next: IsItemExists?
+          IsItemExists?:
+            Type: Choice
+            Default: CreateItem
+            Choices:
+              - Variable: $.publish_status.is_published
+                BooleanEquals: true
+                Next: UpdateItem
+          CreateItem:
+            Type: Task
+            Resource: arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${self:provider.stage}-CreateItem
+            ResultPath: $.item_id
+            Next: UpdatePublishStatus
+          UpdateItem:
+            Type: Task
+            Resource: arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${self:provider.stage}-UpdateItem
+            End: True
+          UpdatePublishStatus:
+            Type: Task
+            Resource: arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${self:provider.stage}-UpdatePublishStatus
+            End: True          
+
+
+resources:
+  Resources:
+    ArticleTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ARTICLE_TABLE_NAME}
+        AttributeDefinitions:
+          - AttributeName: article
+            AttributeType: S
+          - AttributeName: parameter_type
+            AttributeType: S
+        KeySchema:
+          - AttributeName: article
+            KeyType: HASH
+          - AttributeName: parameter_type
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+    PublishRequestQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-publish-request-${self:provider.stage}
+        # VisibilityTime must be greeter than lambda timeout
+        VisibilityTimeout: 45
+    UpdateTemplateVariablesRequestQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-update-template-variables-${self:provider.stage}
+        # VisibilityTime must be greeter than lambda timeout
+        VisibilityTimeout: 45
+  
+  Outputs:
+    TableArn:
+      Description: article config table arn
+      Value: 
+        Fn::GetAtt: [ArticleTable, Arn]
+    PublishRequestQueue:
+      Description: PublishRequestQueue ARN
+      Value: 
+        Fn::GetAtt: PublishRequestQueue.Arn
+    PublishRequestQueueUrl:
+      Description: PublishRequestQueue URL
+      Value: 
+        Ref: PublishRequestQueue
+    UpdateTemplateVariablesRequestQueue:
+      Description: UpdateTemplateVariablesRequestQueue ARN
+      Value: 
+        Fn::GetAtt: UpdateTemplateVariablesRequestQueue.Arn
+    UpdateTemplateVariablesRequestQueueUrl:
+      Description: UpdateTemplateVariablesRequestQueue URL
+      Value: 
+        Ref: UpdateTemplateVariablesRequestQueue
